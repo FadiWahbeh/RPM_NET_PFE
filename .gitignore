@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+.eggs/
+*.manifest
+*.spec
+
+# Virtualenv
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# PyTorch checkpoints and outputs
+outputs/
+outputs/checkpoints/
+*.pth
+
+# Data
+data/source/
+data/*.h5
+
+# Jupyter
+.ipynb_checkpoints
+
+# IDEs and OS
+.vscode/
+*.swp
+*.swo
+.DS_Store
+thumbs.db
+
+# Logs
+*.log
+
+# Others
+.env
+__pycache__/
+.pytest_cache/
