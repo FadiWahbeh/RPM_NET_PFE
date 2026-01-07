@@ -6,10 +6,14 @@ from torch.utils.data import DataLoader
 import open3d as o3d
 import time
 import copy # Pour la fusion propre des nuages
+import numpy as np
 
 from data.dataset import SingleSourceDataset
 from models.rpmnet import RPMNet
+from models.rmse import rmse
 from utils.transform import transform_point_cloud_torch
+
+
 
 # --- CONFIGURATION ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -23,15 +27,9 @@ os.makedirs(VISUAL_DIR, exist_ok=True)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # --- REGLAGES FINS ---
-
-EPOCHS = 30       
-BATCH_SIZE = 8    
-LR = 0.00005
-
 EPOCHS = 30       # Pas besoin de plus si Ep5 est déjà bon
 BATCH_SIZE = 8    
 LR = 0.00005      # <--- J'ai baissé ça (c'était 0.0001). Plus doux pour ne pas "casser" la perfection.
-
 
 def save_combined_ply(pcd1_tensor, color1, pcd2_tensor, color2, filename):
     """ Fusionne physiquement deux nuages dans un seul fichier .ply """
@@ -43,15 +41,6 @@ def save_combined_ply(pcd1_tensor, color1, pcd2_tensor, color2, filename):
     # Création des objets Open3D
     cloud1 = o3d.geometry.PointCloud()
     cloud1.points = o3d.utility.Vector3dVector(pts1)
-
-    cloud1.paint_uniform_color(color1)
-    
-    cloud2 = o3d.geometry.PointCloud()
-    cloud2.points = o3d.utility.Vector3dVector(pts2)
-    cloud2.paint_uniform_color(color2) 
-    
-    # Fusion
-
     cloud1.paint_uniform_color(color1) # ex: Rouge
     
     cloud2 = o3d.geometry.PointCloud()
@@ -59,7 +48,6 @@ def save_combined_ply(pcd1_tensor, color1, pcd2_tensor, color2, filename):
     cloud2.paint_uniform_color(color2) # ex: Vert
     
     # Fusion (Concaténation)
-
     combined = cloud1 + cloud2
     
     # Sauvegarde
@@ -73,10 +61,12 @@ def train():
     
     model = RPMNet(num_iterations=5).to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=LR)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, verbose=True)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3)
     mse_loss = nn.MSELoss()
 
     model.train()
+    rmse_val_min = float('inf')
+    eborch_best = 1
 
     for epoch in range(EPOCHS):
         total_loss = 0
@@ -108,13 +98,6 @@ def train():
         
         print(f"Epoch {epoch+1:03d} | Loss: {avg_loss:.6f} | Time: {time.time() - start_time:.1f}s")
 
-
-        # SAUVEGARDE À CHAQUE EPOCH
-        # 1. Le Cerveau
-        torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, f"rpm_epoch_{epoch+1}.pth"))
-        
-        # 2. Les Images
-
         # --- SAUVEGARDE À CHAQUE EPOCH (1, 2, 3...) ---
         # Plus de modulo %, on sauvegarde tout.
         
@@ -122,7 +105,6 @@ def train():
         torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, f"rpm_epoch_{epoch+1}.pth"))
         
         # 2. Les Images (.ply)
-
         with torch.no_grad():
              # On prend le premier exemple du batch
              src_0 = src[0]
@@ -138,20 +120,22 @@ def train():
                  os.path.join(VISUAL_DIR, f"Ep{epoch+1}_DEPART.ply")
              )
              
-
-             # SAUVEGARDE RESULTAT
-             save_combined_ply(
-                 res_0, [1, 0, 0],  # Bleu
-             )
              # SAUVEGARDE RESULTAT (Bleu + Vert)
              save_combined_ply(
                  res_0, [0, 0, 1],  # Bleu
-
                  tgt_0, [0, 1, 0],  # Vert
                  os.path.join(VISUAL_DIR, f"Ep{epoch+1}_FINAL.ply")
              )
              
              print(f"   -> Ep{epoch+1} sauvegardée.")
+        # Calcul RMSE pour suivi
+        rmse_epoch = rmse(src, tgt)
+        if rmse_epoch < rmse_val_min:
+            rmse_val_min = rmse_epoch
+            eborch_best = epoch 
+        print(f"   -> Nouveau RMSE min: {rmse_val_min:.6f} à l'Epoch {eborch_best}")
+
+
 
 if __name__ == "__main__":
     train()

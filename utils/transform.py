@@ -47,3 +47,4 @@ def sinkhorn(log_alpha, n_iters=5):
         my_log_alpha = my_log_alpha - torch.logsumexp(my_log_alpha, dim=2, keepdim=True)
         my_log_alpha = my_log_alpha - torch.logsumexp(my_log_alpha, dim=1, keepdim=True)
     return torch.exp(my_log_alpha)
+
