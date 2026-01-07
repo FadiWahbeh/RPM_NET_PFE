@@ -23,15 +23,15 @@ os.makedirs(VISUAL_DIR, exist_ok=True)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # --- REGLAGES FINS ---
-<<<<<<< HEAD
+
 EPOCHS = 30       
 BATCH_SIZE = 8    
 LR = 0.00005
-=======
+
 EPOCHS = 30       # Pas besoin de plus si Ep5 est déjà bon
 BATCH_SIZE = 8    
 LR = 0.00005      # <--- J'ai baissé ça (c'était 0.0001). Plus doux pour ne pas "casser" la perfection.
->>>>>>> origin/main
+
 
 def save_combined_ply(pcd1_tensor, color1, pcd2_tensor, color2, filename):
     """ Fusionne physiquement deux nuages dans un seul fichier .ply """
@@ -43,7 +43,7 @@ def save_combined_ply(pcd1_tensor, color1, pcd2_tensor, color2, filename):
     # Création des objets Open3D
     cloud1 = o3d.geometry.PointCloud()
     cloud1.points = o3d.utility.Vector3dVector(pts1)
-<<<<<<< HEAD
+
     cloud1.paint_uniform_color(color1)
     
     cloud2 = o3d.geometry.PointCloud()
@@ -51,7 +51,7 @@ def save_combined_ply(pcd1_tensor, color1, pcd2_tensor, color2, filename):
     cloud2.paint_uniform_color(color2) 
     
     # Fusion
-=======
+
     cloud1.paint_uniform_color(color1) # ex: Rouge
     
     cloud2 = o3d.geometry.PointCloud()
@@ -59,7 +59,7 @@ def save_combined_ply(pcd1_tensor, color1, pcd2_tensor, color2, filename):
     cloud2.paint_uniform_color(color2) # ex: Vert
     
     # Fusion (Concaténation)
->>>>>>> origin/main
+
     combined = cloud1 + cloud2
     
     # Sauvegarde
@@ -108,13 +108,13 @@ def train():
         
         print(f"Epoch {epoch+1:03d} | Loss: {avg_loss:.6f} | Time: {time.time() - start_time:.1f}s")
 
-<<<<<<< HEAD
+
         # SAUVEGARDE À CHAQUE EPOCH
         # 1. Le Cerveau
         torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, f"rpm_epoch_{epoch+1}.pth"))
         
         # 2. Les Images
-=======
+
         # --- SAUVEGARDE À CHAQUE EPOCH (1, 2, 3...) ---
         # Plus de modulo %, on sauvegarde tout.
         
@@ -122,7 +122,7 @@ def train():
         torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, f"rpm_epoch_{epoch+1}.pth"))
         
         # 2. Les Images (.ply)
->>>>>>> origin/main
+
         with torch.no_grad():
              # On prend le premier exemple du batch
              src_0 = src[0]
@@ -138,15 +138,15 @@ def train():
                  os.path.join(VISUAL_DIR, f"Ep{epoch+1}_DEPART.ply")
              )
              
-<<<<<<< HEAD
+
              # SAUVEGARDE RESULTAT
              save_combined_ply(
                  res_0, [1, 0, 0],  # Bleu
-=======
+             )
              # SAUVEGARDE RESULTAT (Bleu + Vert)
              save_combined_ply(
                  res_0, [0, 0, 1],  # Bleu
->>>>>>> origin/main
+
                  tgt_0, [0, 1, 0],  # Vert
                  os.path.join(VISUAL_DIR, f"Ep{epoch+1}_FINAL.ply")
              )

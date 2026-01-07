@@ -2,10 +2,9 @@ import numpy as np
 import torch
 
 def get_random_transform(max_angle_radians):
-<<<<<<< HEAD
-=======
+
     # Rotation (inchangé)
->>>>>>> origin/main
+
     anglex = np.random.uniform(-max_angle_radians, max_angle_radians)
     angley = np.random.uniform(-max_angle_radians, max_angle_radians)
     anglez = np.random.uniform(-max_angle_radians, max_angle_radians)
@@ -19,12 +18,11 @@ def get_random_transform(max_angle_radians):
     Rz = np.array([[cosz, -sinz, 0], [sinz, cosz, 0], [0, 0, 1]])
     R = Rz @ Ry @ Rx
     
-<<<<<<< HEAD
-=======
+
     # --- LE POINT CRITIQUE ---
     # Comme l'objet fait taille 1.0, on le pousse de 1.5 à 3.0 maximum.
     # Si c'est trop loin, l'IA se perd.
->>>>>>> origin/main
+
     distance = np.random.uniform(1.5, 3.0)
     
     direction = np.random.normal(size=3)
