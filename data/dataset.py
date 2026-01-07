@@ -8,21 +8,18 @@ from utils.transform import get_random_transform, apply_transform
 class SingleSourceDataset(Dataset):
     def __init__(self, root_dir, num_points=1024):
         self.src_dir = os.path.join(root_dir, 'data', 'source')
-<<<<<<< HEAD
-=======
         # Fallback pour trouver le dossier
->>>>>>> origin/main
+
         if not os.path.exists(self.src_dir):
              self.src_dir = os.path.join(root_dir, 'source')
 
         self.num_points = num_points
         self.files = [f for f in os.listdir(self.src_dir) if f.endswith(('.ply', '.pcd'))]
         self.data_cache = []
-<<<<<<< HEAD
-=======
+
         
         # On commence facile (45 degrés)
->>>>>>> origin/main
+
         self.current_max_angle = np.deg2rad(45) 
 
         print(f"[DATA] Chargement et Normalisation des fichiers...")
@@ -32,10 +29,9 @@ class SingleSourceDataset(Dataset):
                 pcd = o3d.io.read_point_cloud(path)
                 points = np.asarray(pcd.points)
                 
-<<<<<<< HEAD
-=======
+
                 # --- CORRECTION CRUCIALE : NORMALISATION ---
->>>>>>> origin/main
+
                 # 1. On centre l'objet en (0,0,0)
                 points = points - np.mean(points, axis=0)
                 # 2. On calcule sa taille maximale
