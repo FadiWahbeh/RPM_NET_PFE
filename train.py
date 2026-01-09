@@ -65,7 +65,7 @@ def train():
     mse_loss = nn.MSELoss()
 
     model.train()
-    rmse_val_min = float('inf')
+    rmse_val_min = 3.4
     eborch_best = 1
 
     for epoch in range(EPOCHS):
@@ -106,6 +106,7 @@ def train():
         
         # 2. Les Images (.ply)
         with torch.no_grad():
+            
              # On prend le premier exemple du batch
              src_0 = src[0]
              tgt_0 = tgt[0]
@@ -128,14 +129,15 @@ def train():
              )
              
              print(f"   -> Ep{epoch+1} sauvegardée.")
+        
+        res = transform_point_cloud_torch(src, R_pred, t_pred)
         # Calcul RMSE pour suivi
-        rmse_epoch = rmse(src, tgt)
+        rmse_epoch = rmse(src.cpu().detach(), tgt.cpu().detach())
         if rmse_epoch < rmse_val_min:
             rmse_val_min = rmse_epoch
-            eborch_best = epoch 
-        print(f"   -> Nouveau RMSE min: {rmse_val_min:.6f} à l'Epoch {eborch_best}")
-
-
+            eborch_best = epoch + 1
+        print (f"   -> RMSE Epoch {epoch+1}: {rmse_epoch:.6f}")
+        print(f"   -> Nouveau RMSE min: {rmse_val_min:.6f} a l'Epoch {eborch_best}")
 
 if __name__ == "__main__":
     train()

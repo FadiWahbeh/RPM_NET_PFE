@@ -21,15 +21,17 @@ class RPMNet(nn.Module):
             nn.Linear(128, 1) 
         )
 
-    # SVD Pondéré (Weighted SVD)
+    # SVD Pondéré
     def compute_weighted_procrustes(self, src, tgt, weights):
         # src, tgt: (B, N, 3)
         # weights: (B, N, N)
+        
+        # pour chaque point i la masse totale
         weights_sum = torch.sum(weights, dim=2, keepdim=True) + 1e-8
         
         # Barycentres pondérés
-        src_mean = torch.matmul(weights, src) / weights_sum
-        tgt_mean = tgt.clone()
+        #src_mean = torch.matmul(weights, tgt) / weights_sum
+        #tgt_mean = tgt.clone()
         
         # On doit recentrer les points pour SVD
         # Pour faire simple dans cette implémentation, on utilise SVD classique sur les correspondances
@@ -63,7 +65,7 @@ class RPMNet(nn.Module):
         
         batch_size = src.size(0)
         
-        # Initialisation Transformation (Identité)
+        # Initialisation Transformation
         R_acc = torch.eye(3).view(1, 3, 3).repeat(batch_size, 1, 1).to(src.device)
         t_acc = torch.zeros(batch_size, 3).to(src.device)
         
