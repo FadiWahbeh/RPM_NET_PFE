@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 
+# créer une rotation R + une translation t réalistes et contrôlées.
 def get_random_transform(max_angle_radians):
     anglex = np.random.uniform(-max_angle_radians, max_angle_radians)
     angley = np.random.uniform(-max_angle_radians, max_angle_radians)
@@ -15,27 +16,25 @@ def get_random_transform(max_angle_radians):
     Rz = np.array([[cosz, -sinz, 0], [sinz, cosz, 0], [0, 0, 1]])
     R = Rz @ Ry @ Rx
     
-    # --- DISTANCE AUGMENTÉE (Séparation nette) ---
-    # 0.5 à 1.0 : L'objet source est repoussé à une distance égale à 
-    # la moitié ou la totalité de sa propre taille. Impossible qu'ils se chevauchent.
-    distance = np.random.uniform(0.5, 1.0)
+    distance = np.random.uniform(1.5, 2.5)
     
     direction = np.random.normal(size=3)
     norm = np.linalg.norm(direction)
     if norm == 0: norm = 1
     direction /= norm
     t = direction * distance
-    
     return R, t
 
 def apply_transform(points, R, t):
     return points @ R.T + t
 
 def transform_point_cloud_torch(points, R, t):
+    # multiplication batch (B,3,3) × (B,3,N) = (B,3,N)
     rotated = torch.bmm(R, points)
     translated = rotated + t.unsqueeze(2)
     return translated
 
+#transformer une matrice de scores (B,N,N) en une matrice de probabilités de correspondance.
 def sinkhorn(log_alpha, n_iters=5):
     my_log_alpha = log_alpha.clone()
     for _ in range(n_iters):
