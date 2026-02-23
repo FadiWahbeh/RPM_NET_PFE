@@ -2,7 +2,6 @@ import time
 import torch
 import torch.nn as nn
 
-# Imports robustes (package ou pas)
 try:
     from models.dgcnn import DGCNN_Embedding
 except Exception:
@@ -21,7 +20,6 @@ class RPMNet(nn.Module):
         self.emb_dims = 512
         self.encoder = DGCNN_Embedding(emb_dims=self.emb_dims)
 
-        # (Tu ne l'utilises pas pour l’instant → on laisse pour éviter de casser ton code)
         self.weights_net = nn.Sequential(
             nn.Linear(self.emb_dims, 256),
             nn.ReLU(),
@@ -34,38 +32,32 @@ class RPMNet(nn.Module):
         """
         src: (B,N,3)
         tgt: (B,N,3)
-        weights: (B,N,N)  (ligne i = distribution sur j)
+        weights: (B,N,N)
         """
-        # Somme par ligne (pour chaque point source i)
-        w_row = weights.sum(dim=2, keepdim=True) + eps          # (B,N,1)
+        w_row = weights.sum(dim=2, keepdim=True) + eps
+        tgt_corr = torch.matmul(weights, tgt) / w_row
 
-        # Correspondances attendues (barycentre cible pour chaque point src)
-        tgt_corr = torch.matmul(weights, tgt) / w_row           # (B,N,3)
-
-        # Centroïdes (pondérés côté src, implicites côté tgt_corr via w_row)
-        src_centroid = (src * w_row).sum(dim=1, keepdim=True) / (w_row.sum(dim=1, keepdim=True) + eps)  # (B,1,3)
-        tgt_centroid = (tgt_corr * w_row).sum(dim=1, keepdim=True) / (w_row.sum(dim=1, keepdim=True) + eps)            # (B,1,3)
+        src_centroid = (src * w_row).sum(dim=1, keepdim=True) / (w_row.sum(dim=1, keepdim=True) + eps)
+        tgt_centroid = (tgt_corr * w_row).sum(dim=1, keepdim=True) / (w_row.sum(dim=1, keepdim=True) + eps)
 
         src_centered = src - src_centroid
         tgt_centered = tgt_corr - tgt_centroid
 
-        # Covariance pondérée
-        H = torch.matmul((src_centered * w_row).transpose(1, 2), tgt_centered)  # (B,3,3)
+        H = torch.matmul((src_centered * w_row).transpose(1, 2), tgt_centered)
 
         U, S, V = torch.svd(H)
         R = torch.matmul(V, U.transpose(1, 2))
 
-        # Fix réflexion
         det = torch.det(R)
         diag = torch.ones((src.size(0), 3), device=src.device)
         diag[:, 2] = torch.sign(det)
         R = torch.matmul(torch.matmul(V, torch.diag_embed(diag)), U.transpose(1, 2))
 
-        t = tgt_centroid.squeeze(1) - torch.matmul(R, src_centroid.squeeze(1).unsqueeze(2)).squeeze(2)  # (B,3)
+        t = tgt_centroid.squeeze(1) - torch.matmul(R, src_centroid.squeeze(1).unsqueeze(2)).squeeze(2)
         return R, t
 
     def forward(self, src, tgt, return_timings: bool = False):
-        # src, tgt : (B,3,N)
+        # src,tgt: (B,3,N)
         src_p = src.transpose(1, 2)  # (B,N,3)
         tgt_p = tgt.transpose(1, 2)  # (B,N,3)
 

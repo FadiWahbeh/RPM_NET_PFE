@@ -19,13 +19,13 @@ def plot_training_results(save_dir=None, show=True):
     df = pd.read_csv(log_file)
 
     if df.shape[0] == 0:
-        print("training_log.csv est vide. Laisse train.py écrire quelques epochs.")
+        print("training_log.csv est vide.")
         return
 
     def has_cols(cols):
         return all(c in df.columns for c in cols)
 
-    # 1) LOSS
+    # LOSS
     if has_cols(["Epoch", "Train_Loss", "Val_Loss"]):
         plt.figure(figsize=(10, 5))
         plt.plot(df["Epoch"], df["Train_Loss"], label="Train Loss")
@@ -40,17 +40,19 @@ def plot_training_results(save_dir=None, show=True):
         if show:
             plt.show()
         plt.close()
-    else:
-        print("[WARN] Colonnes loss manquantes dans le CSV.")
 
-    # 2) RMSE
+    # RMSE (unit)
     if has_cols(["Epoch", "Train_RMSE", "Val_RMSE"]):
+        unit = ""
+        if "Train_RMSE_Unit" in df.columns and isinstance(df["Train_RMSE_Unit"].iloc[0], str):
+            unit = df["Train_RMSE_Unit"].iloc[0]
+
         plt.figure(figsize=(10, 5))
-        plt.plot(df["Epoch"], df["Train_RMSE"], label="Train RMSE")
-        plt.plot(df["Epoch"], df["Val_RMSE"], label="Test RMSE", linestyle="--")
+        plt.plot(df["Epoch"], df["Train_RMSE"], label=f"Train RMSE{unit}")
+        plt.plot(df["Epoch"], df["Val_RMSE"], label=f"Test RMSE{unit}", linestyle="--")
         plt.xlabel("Epoch")
-        plt.ylabel("RMSE")
-        plt.title("RMSE: Train vs Test")
+        plt.ylabel(f"RMSE{unit}")
+        plt.title("RMSE (absolute): Train vs Test")
         plt.grid(True)
         plt.legend()
         plt.tight_layout()
@@ -58,10 +60,24 @@ def plot_training_results(save_dir=None, show=True):
         if show:
             plt.show()
         plt.close()
-    else:
-        print("[WARN] Colonnes RMSE manquantes dans le CSV.")
 
-    # 3) LCP
+    # RMSE (%)
+    if has_cols(["Epoch", "Train_RMSE_Pct", "Val_RMSE_Pct"]):
+        plt.figure(figsize=(10, 5))
+        plt.plot(df["Epoch"], df["Train_RMSE_Pct"], label="Train RMSE (%)")
+        plt.plot(df["Epoch"], df["Val_RMSE_Pct"], label="Test RMSE (%)", linestyle="--")
+        plt.xlabel("Epoch")
+        plt.ylabel("RMSE (% of size)")
+        plt.title("RMSE (% of object size): Train vs Test")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, "rmse_percent_train_vs_test.png"))
+        if show:
+            plt.show()
+        plt.close()
+
+    # LCP
     if has_cols(["Epoch", "Train_LCP", "Val_LCP"]):
         plt.figure(figsize=(10, 5))
         plt.plot(df["Epoch"], df["Train_LCP"], label="Train LCP")
@@ -76,10 +92,8 @@ def plot_training_results(save_dir=None, show=True):
         if show:
             plt.show()
         plt.close()
-    else:
-        print("[WARN] Colonnes LCP manquantes dans le CSV.")
 
-    # 4) TIMINGS (optionnel)
+    # TIMINGS (optionnel)
     if "Epoch" in df.columns and "Epoch_Time_s" in df.columns:
         plt.figure(figsize=(10, 5))
         plt.plot(df["Epoch"], df["Epoch_Time_s"], label="Epoch time (s)")
