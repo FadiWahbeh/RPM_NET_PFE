@@ -3,8 +3,6 @@ import torch.nn as nn
 
 
 def knn(x, k):
-    # ✅ FIX: torch.no_grad() — les indices sont discrets (non-différentiables)
-    # L'ancienne version trackait quand même le graphe de calcul pour (B,N,N) → gaspillage mémoire GPU
     with torch.no_grad():
         inner = -2 * torch.matmul(x.transpose(2, 1), x)
         xx = torch.sum(x ** 2, dim=1, keepdim=True)

@@ -7,9 +7,8 @@ import glob
 
 SUPPORTED_EXTS = ('.ply', '.pcd', '.xyz', '.txt', '.pts', '.npy', '.npz')
 
-
+# FPS pour sous-échantillonnage.
 def farthest_point_sample(point, npoint):
-    """FPS pour sous-échantillonnage."""
     N, D = point.shape
     if N <= 0:
         raise ValueError("FPS: nuage vide")
@@ -32,9 +31,8 @@ def farthest_point_sample(point, npoint):
 
     return point[centroids]
 
-
+# Trouve les paires à partir de la structure de dossiers.
 def find_pairs_from_folders(data_dir, source_sensor='lidar', target_sensor='kinect'):
-    """Trouve les paires à partir de la structure de dossiers."""
     source_dir = os.path.join(data_dir, source_sensor)
     target_dir = os.path.join(data_dir, target_sensor)
     
@@ -71,17 +69,15 @@ def find_pairs_from_folders(data_dir, source_sensor='lidar', target_sensor='kine
     
     return pairs
 
-
+# Estime les normales pour un nuage de points.
 def estimate_normals(points, k=20):
-    """Estime les normales pour un nuage de points."""
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points)
     pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=k))
     return np.asarray(pcd.normals).astype(np.float32)
 
-
+# Calcule les descripteurs FPFH.
 def compute_fpfh(points, normals):
-    """Calcule les descripteurs FPFH."""
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points)
     pcd.normals = o3d.utility.Vector3dVector(normals)
@@ -182,7 +178,6 @@ class CrossSourceDataset(Dataset):
             src_data = self._preprocess(src_points)
             tgt_data = self._preprocess(tgt_points)
             
-            # --- CORRECTION ICI : Concaténer XYZ et Normales AVANT le sampling ---
             src_input = src_data['points']
             tgt_input = tgt_data['points']
             
@@ -191,8 +186,7 @@ class CrossSourceDataset(Dataset):
             if self.use_normals and 'normals' in tgt_data:
                 tgt_input = np.concatenate([tgt_input, tgt_data['normals']], axis=1)
             
-            # Le FPS se fera uniquement sur le XYZ (grâce au point[:, :3] dans ta fonction)
-            # mais il gardera les normales synchronisées !
+            # Le FPS se fera uniquement sur le XYZ
             src_sampled = farthest_point_sample(src_input, self.num_points)
             tgt_sampled = farthest_point_sample(tgt_input, self.num_points)
             

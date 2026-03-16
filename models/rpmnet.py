@@ -40,10 +40,6 @@ class RPMNet(nn.Module):
 
         idx = self._knn_idx(src_xyz, k)        # (B,N,k)
         B, N, _ = src_xyz.shape
-
-        # ✅ FIX OOM: indexation plate O(B·N·k) au lieu de O(B·N²)
-        # L'ancienne version faisait .expand(B, N, N, 3) ce qui allouait
-        # un tenseur de B×N×N×3 floats (~192MB pour B=8, N=1024) → OOM GPU.
         batch_offset = torch.arange(B, device=src_xyz.device).view(B, 1, 1) * N
         idx_flat = (idx + batch_offset).reshape(-1)          # (B·N·k,)
 
@@ -65,13 +61,14 @@ class RPMNet(nn.Module):
         P2 = P2 / (P2.sum(dim=2, keepdim=True) + 1e-8)
         return P2
 
+        """
+            src: (B,N,3)
+            tgt: (B,N,3)
+            weights: (B,N,N)
+            AMP-safe: SVD done in float32.
+        """
     def compute_weighted_procrustes(self, src, tgt, weights, eps=1e-8):
-        """
-        src: (B,N,3)
-        tgt: (B,N,3)
-        weights: (B,N,N)
-        AMP-safe: SVD done in float32.
-        """
+
         w_row = weights.sum(dim=2, keepdim=True) + eps
         tgt_corr = torch.matmul(weights, tgt) / w_row
 
@@ -82,8 +79,6 @@ class RPMNet(nn.Module):
         tgt_centered = tgt_corr - tgt_centroid
 
         H = torch.matmul((src_centered * w_row).transpose(1, 2), tgt_centered)  # (B,3,3)
-
-        # ✅ AMP fix: SVD in float32
         H32 = H.float()
 
         try:
@@ -96,8 +91,6 @@ class RPMNet(nn.Module):
 
         det = torch.det(R)
         diag_fix = torch.ones((src.size(0), 3), device=src.device, dtype=torch.float32)
-        # ✅ FIX sign(0): torch.sign(0) = 0 détruit la 3e colonne de R si det ≈ 0
-        # torch.where garantit -1 ou +1, jamais 0.
         diag_fix[:, 2] = torch.where(det < 0,
                              torch.full_like(det, -1.0),
                              torch.ones_like(det))

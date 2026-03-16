@@ -5,12 +5,12 @@ import csv
 import numpy as np
 import torch
 import torch.optim as optim
+import torch.nn as nn
 from torch.utils.data import DataLoader
 import open3d as o3d
 
-# =========================
 # SETTINGS
-# =========================
+
 SAVE_BEST = True
 BEST_NAME = "rpm_best.pth"
 
@@ -18,7 +18,7 @@ LCP_RATIO = 0.02
 RMSE_UNIT = "m"
 LOG_RMSE_NORM = True
 
-# ICP only for EXPORT (pas pendant les métriques)
+# ICP only for EXPORT
 USE_ICP_FOR_EXPORT = True
 ICP_VOXEL = 0.10
 ICP_MAX_CORR_FACTOR = 0.05
@@ -31,14 +31,16 @@ METRICS_MAX_BATCHES_VAL = 10
 
 # Early stopping / rollback
 EARLY_STOPPING = True
-PATIENCE_EPOCHS = 10
+PATIENCE_EPOCHS = 25
 ROLLBACK_ON_DEGRADE = True
 DEGRADE_TOL = 1.10
 ROLLBACK_LR_FACTOR = 0.5
 
-# =========================
+# Exports
+EXPORT_EVERY = 1
+
 # PATHS
-# =========================
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 for p in [BASE_DIR, os.path.join(BASE_DIR, "models"), os.path.join(BASE_DIR, "utils")]:
     if p not in sys.path:
@@ -62,32 +64,35 @@ OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
 VIS_TRAIN_DIR = os.path.join(OUTPUT_DIR, "visuals_train")
 VIS_TEST_DIR  = os.path.join(OUTPUT_DIR, "visuals_test")
 CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "checkpoints")
-LOG_FILE = os.path.join(OUTPUT_DIR, "training_log.csv")
+PLOT_DIR = os.path.join(OUTPUT_DIR, "Plot")
 
 os.makedirs(VIS_TRAIN_DIR, exist_ok=True)
 os.makedirs(VIS_TEST_DIR, exist_ok=True)
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+os.makedirs(PLOT_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # HYPERPARAMS
-EPOCHS =  nb                            
+EPOCHS = 200
 BATCH_SIZE = 8
 LR = 1e-4
 NUM_POINTS = 1024
 NUM_ITERS = 5
-SAVE_EVERY = 1
 
-# DataLoader perf (Windows: si soucis -> NUM_WORKERS=0)
+# DataLoader perferences
 NUM_WORKERS = 4
 PIN_MEMORY = True
 PERSISTENT_WORKERS = True
 
+# LOG FILES 
+RUN_STAMP = time.strftime("%Y%m%d_%H%M%S")
+LOG_FILE = os.path.join(OUTPUT_DIR, f"training_log_{RUN_STAMP}.csv")
+LOG_LATEST = os.path.join(OUTPUT_DIR, "training_log_latest.csv")
 
-# =========================
-# Helpers
-# =========================
+
+# Helpers  
 def batch_diag_from_tgt(tgt_b3n: torch.Tensor, eps=1e-9) -> torch.Tensor:
     pmin = tgt_b3n.amin(dim=2)
     pmax = tgt_b3n.amax(dim=2)
@@ -123,33 +128,6 @@ def save_colored_pair(pointsA, rgbA, pointsB, rgbB, out_path):
     C = np.vstack([CA, CB])
     save_ply(P, C, out_path)
 
-
-# ✅ Distance de Chamfer symétrique — remplace MSE point-à-point
-# Mathématiquement: (1/N)Σ_i min_j||si-tj||² + (1/M)Σ_j min_i||tj-si||²
-# Correcte pour des nuages sans correspondance par index (Kinect ≠ LiDAR).
-# L'ancienne MSE(src_iter - tgt) comparait des points aléatoires et ne
-# supervisait aucun alignement réel.
-def chamfer_loss_batch(src_t: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
-    """
-    src_t, tgt: (B, 3, N) — déjà normalisés par diag si besoin.
-    Retourne un scalaire (moyenne sur le batch).
-    """
-    s = src_t.transpose(1, 2)                         # (B,N,3)
-    t = tgt.transpose(1, 2)                           # (B,M,3)
-
-    ss = (s ** 2).sum(dim=2, keepdim=True)            # (B,N,1)
-    tt = (t ** 2).sum(dim=2, keepdim=True)            # (B,M,1)
-    cross = torch.bmm(s, t.transpose(1, 2))           # (B,N,M)
-    dist2 = (ss - 2.0 * cross + tt.transpose(1, 2)).clamp(min=0.0)  # (B,N,M)
-
-    d_s2t = dist2.min(dim=2).values.mean(dim=1)       # (B,) src→tgt
-    d_t2s = dist2.min(dim=1).values.mean(dim=1)       # (B,) tgt→src
-    return (d_s2t + d_t2s).mean()                     # scalaire
-
-
-# =========================
-# ICP only for EXPORT
-# =========================
 def _to_o3d_pcd(points_np: np.ndarray) -> o3d.geometry.PointCloud:
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points_np.astype(np.float64))
@@ -193,9 +171,6 @@ def icp_refine_o3d(src_np: np.ndarray, tgt_np: np.ndarray) -> np.ndarray:
     t = T[:3, 3].astype(np.float32)
     return (src_np @ R.T) + t
 
-# =========================
-# Export visuals (LOW)
-# =========================
 def export_low(epoch_idx, base_dir, src_tensor, tgt_tensor, transforms):
     ep_dir = os.path.join(base_dir, f"Ep{epoch_idx:03d}")
     os.makedirs(ep_dir, exist_ok=True)
@@ -219,12 +194,12 @@ def export_low(epoch_idx, base_dir, src_tensor, tgt_tensor, transforms):
         save_colored_single(src_icp, [0, 1, 1], os.path.join(ep_dir, "Result_ICP_low.ply"))
         save_colored_pair(src_icp, [0, 1, 1], tgt0, [0, 1, 0], os.path.join(ep_dir, "Result_ICP_plus_Target_low.ply"))
 
-# =========================
-# TRAIN
-# =========================
-def train():
-    print(" TRAIN Kinect->LiDAR (FAST) - ICP only for EXPORT, cached dataset, lite metrics")
 
+def train():
+    print("TRAIN Kinect->LiDAR (FAST) - unique CSV per run + latest alias")
+    print(f"[LOG] {LOG_FILE}")
+
+    # dataset
     train_dataset = PairedKinectLidarDataset(BASE_DIR, mode="train", num_points=NUM_POINTS, preload_cache=True)
     test_dataset  = PairedKinectLidarDataset(BASE_DIR, mode="test",  num_points=NUM_POINTS, preload_cache=True)
 
@@ -245,14 +220,14 @@ def train():
     model = RPMNet(num_iterations=NUM_ITERS, use_dsc_lite=True, dsc_k=12).to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, verbose=True)
-    # ✅ nn.MSELoss supprimé: remplacé par chamfer_loss_batch
+    mse_loss = nn.MSELoss()
 
     best_val = float("inf")
     best_path = os.path.join(CHECKPOINT_DIR, BEST_NAME)
     best_state = None
     bad_epochs = 0
 
-    write_header = not os.path.exists(LOG_FILE)
+    # Write CSV header
     header = [
         "Epoch",
         "Train_Loss", "Val_Loss",
@@ -262,40 +237,45 @@ def train():
         "Train_LCP", "Val_LCP",
         "Epoch_Time_s", "Total_Time_s"
     ]
-    if write_header:
-        with open(LOG_FILE, "w", newline="") as f:
-            csv.writer(f).writerow(header)
+    with open(LOG_FILE, "w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow(header)
+
+    # update latest alias
+    try:
+        with open(LOG_LATEST, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(["log_file"])
+            csv.writer(f).writerow([os.path.basename(LOG_FILE)])
+    except Exception:
+        pass
 
     t_total0 = time.perf_counter()
 
     for epoch in range(1, EPOCHS + 1):
         t_epoch0 = time.perf_counter()
-
-        # ---------------- TRAIN ----------------
         model.train()
         total_loss = 0.0
         train_rmse_list, train_rmse_pct_list, train_lcp_list = [], [], []
-        export_train_pack = None
+        export_pack = None
 
         for bi, (src, tgt, _true_R, _true_t, fnames) in enumerate(train_loader):
-            src, tgt = src.to(DEVICE, non_blocking=True), tgt.to(DEVICE, non_blocking=True)
+            src = src.to(DEVICE, non_blocking=True)
+            tgt = tgt.to(DEVICE, non_blocking=True)
+
             optimizer.zero_grad()
 
+            # rpmnet returns 3 values when return_timings=False
             R_pred, t_pred, transforms = model(src, tgt, return_timings=False)
 
-            diag = batch_diag_from_tgt(tgt)   # (B,)
-            diag_b = diag.view(-1, 1, 1)       # (B,1,1)
+            diag = batch_diag_from_tgt(tgt)
+            diag_b = diag.view(-1, 1, 1)
 
-            # ✅ FIX LOSS: Chamfer symétrique avec pondération itérative.
-            # MSE(src_iter - tgt) comparait points par index sans correspondance
-            # réelle entre Kinect et LiDAR → ne supervisait aucun alignement.
-            loss = torch.zeros(1, device=DEVICE)
+            loss = 0.0
             n_iters = len(transforms)
             for i, (r_iter, t_iter) in enumerate(transforms):
                 w = 1.0 / (2 ** (n_iters - 1 - i))
                 src_iter = transform_point_cloud_torch(src, r_iter, t_iter)
-                loss = loss + w * chamfer_loss_batch(src_iter / diag_b, tgt / diag_b)
-            loss = loss.squeeze()
+                err = (src_iter - tgt) / diag_b
+                loss = loss + w * mse_loss(err, torch.zeros_like(err))
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -303,16 +283,10 @@ def train():
 
             total_loss += float(loss.item())
 
-            # ✅ FIX EXPORT: .detach() sur les transforms pour libérer le graphe
-            # de calcul GPU dès le premier batch au lieu d'attendre la fin de l'epoch.
-            if export_train_pack is None:
-                export_train_pack = (
-                    src.detach(),
-                    tgt.detach(),
-                    [(r.detach(), t.detach()) for r, t in transforms]
-                )
+            if export_pack is None:
+                export_pack = (src.detach(), tgt.detach(), transforms)
 
-            # Metrics only on a few batches
+            # Metrics only on subset
             if bi < METRICS_MAX_BATCHES_TRAIN:
                 with torch.no_grad():
                     src_final = transform_point_cloud_torch(src, R_pred, t_pred)
@@ -334,42 +308,24 @@ def train():
         train_rmse_pct = float(np.mean(train_rmse_pct_list)) if train_rmse_pct_list else 0.0
         train_lcp = float(np.mean(train_lcp_list)) if train_lcp_list else 0.0
 
-        # ---------------- VAL ----------------
         model.eval()
         val_loss_acc = 0.0
         val_rmse_list, val_rmse_pct_list, val_lcp_list = [], [], []
-        export_test_pack = None
 
         with torch.no_grad():
             for bi, (src, tgt, _true_R, _true_t, fnames) in enumerate(test_loader):
-                src, tgt = src.to(DEVICE, non_blocking=True), tgt.to(DEVICE, non_blocking=True)
+                src = src.to(DEVICE, non_blocking=True)
+                tgt = tgt.to(DEVICE, non_blocking=True)
 
                 R_pred, t_pred, transforms = model(src, tgt, return_timings=False)
 
                 diag = batch_diag_from_tgt(tgt)
                 diag_b = diag.view(-1, 1, 1)
 
-                # ✅ FIX VAL LOSS: même formule pondérée que train.
-                # L'ancienne version n'utilisait que la dernière itération avec
-                # poids=1 → courbes train/val mathématiquement incomparables.
-                v_loss = torch.zeros(1, device=DEVICE)
-                n_iters = len(transforms)
-                for i, (r_iter, t_iter) in enumerate(transforms):
-                    w = 1.0 / (2 ** (n_iters - 1 - i))
-                    src_iter_v = transform_point_cloud_torch(src, r_iter, t_iter)
-                    v_loss = v_loss + w * chamfer_loss_batch(src_iter_v / diag_b, tgt / diag_b)
-                val_loss_acc += float(v_loss.item())
-
-                # src_final_val pour les métriques (dernière itération)
-                src_final_val = transform_point_cloud_torch(src, *transforms[-1])
-
-                # ✅ FIX EXPORT: .detach() sur les transforms
-                if export_test_pack is None:
-                    export_test_pack = (
-                        src.detach(),
-                        tgt.detach(),
-                        [(r.detach(), t.detach()) for r, t in transforms]
-                    )
+                last_r, last_t = transforms[-1]
+                src_final_val = transform_point_cloud_torch(src, last_r, last_t)
+                err = (src_final_val - tgt) / diag_b
+                val_loss_acc += float(mse_loss(err, torch.zeros_like(err)).item())
 
                 if bi < METRICS_MAX_BATCHES_VAL:
                     for b in range(src.size(0)):
@@ -392,7 +348,6 @@ def train():
 
         scheduler.step(val_loss)
 
-        # Time + print
         t_epoch1 = time.perf_counter()
         epoch_time = t_epoch1 - t_epoch0
         total_time = t_epoch1 - t_total0
@@ -407,9 +362,10 @@ def train():
             f"Epoch {epoch_time:.1f}s | Total {total_time/60:.1f}min"
         )
 
-        with open(LOG_FILE, "a", newline="") as f:
+        with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow([
-                epoch, train_loss, val_loss,
+                epoch,
+                train_loss, val_loss,
                 train_rmse, val_rmse,
                 RMSE_UNIT, RMSE_UNIT,
                 train_rmse_pct, val_rmse_pct,
@@ -441,11 +397,12 @@ def train():
             break
 
         # Exports
-        if epoch % SAVE_EVERY == 0:
-            if export_train_pack is not None:
-                export_low(epoch, VIS_TRAIN_DIR, *export_train_pack)
-            if export_test_pack is not None:
-                export_low(epoch, VIS_TEST_DIR, *export_test_pack)
+        if export_pack is not None and epoch % EXPORT_EVERY == 0:
+            src_b, tgt_b, tr = export_pack
+            export_low(epoch, VIS_TRAIN_DIR, src_b, tgt_b, tr)
+
+    print(f"[DONE] Log saved: {LOG_FILE}")
+    print(f"[DONE] Latest pointer: {LOG_LATEST}")
 
 
 if __name__ == "__main__":

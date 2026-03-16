@@ -4,12 +4,6 @@ import torch
 
 
 def _to_numpy_Nx3(pts) -> np.ndarray:
-    """
-    Convertit tensor ou array en (N,3) numpy float32.
-    ✅ FIX shape: double condition — évite la transposition erronée si N==3.
-    L'ancienne version faisait shape[0]==3 sans vérifier shape[1],
-    ce qui transposait incorrectement un nuage de 3 points en (3,3).
-    """
     if torch.is_tensor(pts):
         pts = pts.detach().cpu().numpy()
     pts = np.asarray(pts, dtype=np.float32)
@@ -19,27 +13,14 @@ def _to_numpy_Nx3(pts) -> np.ndarray:
 
 
 def _build_nn(target: np.ndarray) -> NearestNeighbors:
-    """
-    Construit et retourne un KD-tree fitté sur target.
-    ✅ Séparé pour clarté et réutilisation potentielle.
-    algorithm='kd_tree' est plus rapide que 'auto' pour des nuages 3D denses.
-    """
     return NearestNeighbors(n_neighbors=1, algorithm='kd_tree').fit(target)
 
-
+"""
+RMSE symétrique entre deux nuages de points.
+Formule: sqrt( (MSE(src→tgt) + MSE(tgt→src)) / 2 )
+"""
 def compute_rmse_cloudcompare(source, target) -> float:
-    """
-    RMSE symétrique entre deux nuages de points.
 
-    Formule: sqrt( (MSE(src→tgt) + MSE(tgt→src)) / 2 )
-
-    ✅ FIX asymétrie: l'ancienne version ne calculait que src→tgt.
-    Un RMSE one-way peut être faible même si la cible a des zones
-    entières non couvertes par la source (faux positif d'alignement).
-    La version symétrique pénalise les deux sens.
-
-    ✅ FIX robustesse: garde contre nuages vides.
-    """
     source = _to_numpy_Nx3(source)
     target = _to_numpy_Nx3(target)
 
@@ -57,14 +38,12 @@ def compute_rmse_cloudcompare(source, target) -> float:
 
     return float(np.sqrt((mse_s2t + mse_t2s) / 2.0))
 
-
+"""
+LCP adaptatif: threshold = ratio * diag(AABB_target).
+ratio=0.02 => 2% de la taille de l'objet cible.
+"""
 def compute_lcp_adaptive(source, target, ratio: float = 0.02) -> float:
-    """
-    LCP adaptatif: threshold = ratio * diag(AABB_target).
-    ratio=0.02 => 2% de la taille de l'objet cible.
 
-    ✅ FIX robustesse: garde contre nuages vides.
-    """
     source = _to_numpy_Nx3(source)
     target = _to_numpy_Nx3(target)
 
