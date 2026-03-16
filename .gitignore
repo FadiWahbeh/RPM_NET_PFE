@@ -24,6 +24,7 @@ outputs/checkpoints/
 *.pth
 
 # Data
+data/
 data/source/
 data/*.h5
 
