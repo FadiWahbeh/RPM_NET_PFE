@@ -1,9 +1,8 @@
 import numpy as np
 import torch
 
-
+# Rotation 3D à partir d'Euler XYZ.
 def _rotation_from_euler(anglex: float, angley: float, anglez: float) -> np.ndarray:
-    """Rotation 3D à partir d'Euler XYZ (radians)."""
     cosx = np.cos(anglex); sinx = np.sin(anglex)
     cosy = np.cos(angley); siny = np.sin(angley)
     cosz = np.cos(anglez); sinz = np.sin(anglez)
@@ -22,9 +21,8 @@ def _rotation_from_euler(anglex: float, angley: float, anglez: float) -> np.ndar
 
     return (Rz @ Ry @ Rx).astype(np.float32)
 
-
+# Taille caractéristique = diagonale de l'AABB.
 def estimate_object_size(points_xyz: np.ndarray) -> float:
-    """Taille caractéristique = diagonale de l'AABB."""
     if points_xyz.ndim != 2 or points_xyz.shape[1] != 3:
         raise ValueError("estimate_object_size: points_xyz doit être (N,3)")
     pmin = points_xyz.min(axis=0)
@@ -32,16 +30,16 @@ def estimate_object_size(points_xyz: np.ndarray) -> float:
     diag = float(np.linalg.norm(pmax - pmin))
     return diag if diag > 1e-9 else 1.0
 
-
+"""
+Rotation + translation adaptatives: distance = facteur * taille_objet.
+source/target automatiquement séparés selon la taille réelle.
+"""
 def get_random_transform_adaptive(points_xyz: np.ndarray,
                                  max_angle_radians: float,
                                  min_sep_factor: float = 1.25,
                                  max_sep_factor: float = 2.25,
                                  jitter_factor: float = 0.05):
-    """
-    Rotation + translation adaptatives: distance = facteur * taille_objet.
-    -> source/target automatiquement séparés selon la taille réelle.
-    """
+
     size = estimate_object_size(points_xyz)
 
     # Rotation
@@ -77,8 +75,8 @@ def transform_point_cloud_torch(points: torch.Tensor, R: torch.Tensor, t: torch.
     return translated
 
 
+# Transforme une matrice de scores (B,N,N) en une matrice de probabilités.
 def sinkhorn(log_alpha: torch.Tensor, n_iters: int = 5) -> torch.Tensor:
-    """Transforme une matrice de scores (B,N,N) en une matrice de probabilités."""
     my_log_alpha = log_alpha.clone()
     for _ in range(n_iters):
         my_log_alpha = my_log_alpha - torch.logsumexp(my_log_alpha, dim=2, keepdim=True)

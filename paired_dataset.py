@@ -85,18 +85,12 @@ def _statistical_outlier_removal_np(pts: np.ndarray, nb_neighbors=20, std_ratio=
     pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=int(nb_neighbors), std_ratio=float(std_ratio))
     return np.asarray(pcd.points).astype(np.float32)
 
-
-def _farthest_point_sample(point: np.ndarray, npoint: int) -> np.ndarray:
     """
     FPS vectorisé numpy.
     point: (N,3) → return: (npoint,3)
-
-    ✅ FIX performance: np.minimum() remplace le masque booléen.
-    L'ancienne version effectuait distance[mask] = dist[mask] avec
-    une allocation d'un masque bool (N,) à chaque itération.
-    np.minimum(distance, dist, out=distance) est équivalent mais
-    ~2x plus rapide car opération in-place sans masque temporaire.
     """
+def _farthest_point_sample(point: np.ndarray, npoint: int) -> np.ndarray:
+
     N = point.shape[0]
     if N <= 0:
         raise ValueError("FPS: nuage vide")
@@ -112,7 +106,6 @@ def _farthest_point_sample(point: np.ndarray, npoint: int) -> np.ndarray:
         centroids[i] = farthest
         centroid = xyz[farthest]
         dist = np.sum((xyz - centroid) ** 2, axis=1)
-        # ✅ np.minimum in-place: pas de masque temporaire
         np.minimum(distance, dist, out=distance)
         farthest = int(np.argmax(distance))
 
@@ -151,15 +144,12 @@ def _random_rotation(max_angle_rad: float) -> np.ndarray:
     return (Rz @ Ry @ Rx).astype(np.float32)
 
 
+"""
+data/train_data/kinect + data/train_data/lidar
+data/test_data/kinect  + data/test_data/lidar
+"""
 class PairedKinectLidarDataset(Dataset):
-    """
-    data/train_data/kinect + data/train_data/lidar
-    data/test_data/kinect  + data/test_data/lidar
-
-    Optimisation:
-      - cache RAM des nuages preprocessés
-      - pas d'Open3D read/filters à chaque __getitem__
-    """
+    
 
     def __init__(
         self,
@@ -218,8 +208,8 @@ class PairedKinectLidarDataset(Dataset):
         print(f"  LiDAR  dir: {self.lidar_dir} ({len(l_files)} fichiers)")
         print(f"  Pairs found: {len(self.pairs)}")
 
-        self.k_cache = {}  # name -> pts (centered + preprocessed)
-        self.l_cache = {}  # name -> pts (centered + preprocessed)
+        self.k_cache = {}
+        self.l_cache = {}
 
         if self.preload_cache:
             self._preload_all()
