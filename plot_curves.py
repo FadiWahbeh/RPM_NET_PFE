@@ -1,5 +1,6 @@
 import os
 import csv
+import glob
 import pandas as pd
 import matplotlib.pyplot as plt
 
@@ -16,8 +17,42 @@ WANTED_COLS = [
 ]
 
 
+def resolve_latest_log_file(output_dir: str) -> str:
+    """
+    training_log_latest.csv contient juste un pointeur vers le dernier vrai log.
+    On retourne le chemin complet du vrai fichier de log.
+    """
+    latest_ptr = os.path.join(output_dir, "training_log_latest.csv")
+
+    # 1) Si le pointeur existe, on lit le nom du fichier log
+    if os.path.exists(latest_ptr):
+        try:
+            df = pd.read_csv(latest_ptr)
+            if "log_file" in df.columns and len(df) > 0:
+                name = str(df["log_file"].iloc[0]).strip()
+                cand = os.path.join(output_dir, name)
+                if os.path.exists(cand):
+                    return cand
+        except Exception:
+            pass
+
+    # 2) Sinon on prend le plus récent training_log_*.csv
+    candidates = glob.glob(os.path.join(output_dir, "training_log_*.csv"))
+    candidates = [c for c in candidates if not c.endswith("training_log_latest.csv")]
+    if candidates:
+        candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        return candidates[0]
+
+    # 3) fallback legacy
+    legacy = os.path.join(output_dir, "training_log.csv")
+    return legacy
+
+
 def robust_read_training_log(path: str) -> pd.DataFrame:
-    """Lit training_log.csv même si le nombre de colonnes varie selon les lignes."""
+    """
+    Lit un CSV même si certaines lignes ont plus/moins de colonnes.
+    (utile si tu as eu des changements de header avant)
+    """
     with open(path, "r", newline="", encoding="utf-8", errors="replace") as f:
         raw = list(csv.reader(f))
 
@@ -46,12 +81,13 @@ def robust_read_training_log(path: str) -> pd.DataFrame:
 
     df = pd.DataFrame(fixed, columns=header)
 
-    # convert numeric columns
+    # convert numeric
     for c in df.columns:
         if c in ("Train_RMSE_Unit", "Val_RMSE_Unit"):
             continue
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
+    # clean epoch
     if "Epoch" in df.columns:
         df = df[df["Epoch"].notna()].copy()
         df["Epoch"] = df["Epoch"].astype(int)
@@ -61,7 +97,7 @@ def robust_read_training_log(path: str) -> pd.DataFrame:
     if cols:
         df = df[cols]
 
-    print(f"[plot_curves] Loaded rows={len(df)} cols={len(df.columns)} (ignored empty lines={dropped})")
+    print(f"[plot_curves] Using: {os.path.basename(path)} | rows={len(df)} cols={len(df.columns)} dropped={dropped}")
     return df
 
 
@@ -71,30 +107,18 @@ def save_tables(df: pd.DataFrame, out_dir: str):
     if "Epoch" in df.columns:
         df = df.sort_values("Epoch")
 
-    # last 30
     df.tail(30).to_csv(os.path.join(out_dir, "table_last_30.csv"), index=False)
 
-    # best val loss
     if "Val_Loss" in df.columns and df["Val_Loss"].notna().any():
         df.loc[df["Val_Loss"].idxmin()].to_frame().T.to_csv(
             os.path.join(out_dir, "table_best_val_loss.csv"), index=False
         )
-    else:
-        pd.DataFrame({"info": ["Val_Loss missing"]}).to_csv(
-            os.path.join(out_dir, "table_best_val_loss.csv"), index=False
-        )
 
-    # best val rmse
     if "Val_RMSE" in df.columns and df["Val_RMSE"].notna().any():
         df.loc[df["Val_RMSE"].idxmin()].to_frame().T.to_csv(
             os.path.join(out_dir, "table_best_val_rmse.csv"), index=False
         )
-    else:
-        pd.DataFrame({"info": ["Val_RMSE missing"]}).to_csv(
-            os.path.join(out_dir, "table_best_val_rmse.csv"), index=False
-        )
 
-    # summary txt
     lines = []
     lines.append("=== SUMMARY ===")
     lines.append(f"Rows: {len(df)}")
@@ -122,25 +146,22 @@ def save_tables(df: pd.DataFrame, out_dir: str):
     print("[plot_curves] Tables saved in:", out_dir)
 
 
-def plot_training_results(save_dir=None, show=True):
+def plot_training_results(show=True):
     base_dir = os.path.dirname(os.path.abspath(__file__))
     output_dir = os.path.join(base_dir, "outputs")
-    log_file = os.path.join(output_dir, "training_log.csv")
-
-    if save_dir is None:
-        save_dir = os.path.join(output_dir, "Plot")
+    save_dir = os.path.join(output_dir, "Plot")
     os.makedirs(save_dir, exist_ok=True)
 
-    if not os.path.exists(log_file):
-        print("Fichier log introuvable:", log_file)
+    log_path = resolve_latest_log_file(output_dir)
+    if not os.path.exists(log_path):
+        print("Aucun fichier de log trouvé.")
         return
 
-    df = robust_read_training_log(log_file)
+    df = robust_read_training_log(log_path)
     if df.empty:
-        print("training_log.csv est vide ou illisible.")
+        print("Log vide ou illisible:", log_path)
         return
 
-    # make tables now
     save_tables(df, save_dir)
 
     def has(cols):
@@ -166,9 +187,8 @@ def plot_training_results(save_dir=None, show=True):
     if has(["Epoch", "Train_RMSE", "Val_RMSE"]):
         unit = ""
         if "Train_RMSE_Unit" in df.columns and df["Train_RMSE_Unit"].notna().any():
-            unit = str(df["Train_RMSE_Unit"].dropna().iloc[0])
-            if unit and not unit.startswith(" "):
-                unit = " " + unit
+            unit = str(df["Train_RMSE_Unit"].dropna().iloc[0]).strip()
+            unit = f" {unit}" if unit else ""
 
         plt.figure(figsize=(10, 5))
         plt.plot(df["Epoch"], df["Train_RMSE"], label=f"Train RMSE{unit}")
