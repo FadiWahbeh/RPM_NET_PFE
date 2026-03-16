@@ -3,17 +3,13 @@ import torch
 import numpy as np
 import open3d as o3d
 from torch.utils.data import Dataset
-
-try:
-    from utils.transform import get_random_transform_adaptive, apply_transform
-except Exception:
-    from transform import get_random_transform_adaptive, apply_transform
-
+import glob
 
 SUPPORTED_EXTS = ('.ply', '.pcd', '.xyz', '.txt', '.pts', '.npy', '.npz')
 
 
 def farthest_point_sample(point, npoint):
+    """FPS pour sous-échantillonnage."""
     N, D = point.shape
     if N <= 0:
         raise ValueError("FPS: nuage vide")
@@ -37,146 +33,206 @@ def farthest_point_sample(point, npoint):
     return point[centroids]
 
 
-def _find_files_recursive(root_dir):
-    files = []
-    for dirpath, _, filenames in os.walk(root_dir):
-        for f in filenames:
-            if f.lower().endswith(SUPPORTED_EXTS):
-                files.append(os.path.join(dirpath, f))
-    files.sort()
-    return files
+def find_pairs_from_folders(data_dir, source_sensor='lidar', target_sensor='kinect'):
+    """Trouve les paires à partir de la structure de dossiers."""
+    source_dir = os.path.join(data_dir, source_sensor)
+    target_dir = os.path.join(data_dir, target_sensor)
+    
+    if not os.path.exists(source_dir) or not os.path.exists(target_dir):
+        print(f"Attention: Dossiers non trouvés: {source_dir} ou {target_dir}")
+        return []
+    
+    source_files = []
+    for ext in SUPPORTED_EXTS:
+        source_files.extend(glob.glob(os.path.join(source_dir, f'*{ext}')))
+        source_files.extend(glob.glob(os.path.join(source_dir, f'*{ext.upper()}')))
+    
+    pairs = []
+    for src_path in source_files:
+        src_basename = os.path.basename(src_path)
+        src_name = os.path.splitext(src_basename)[0]
+        
+        tgt_path = None
+        for ext in SUPPORTED_EXTS:
+            candidate = os.path.join(target_dir, src_basename)
+            if os.path.exists(candidate):
+                tgt_path = candidate
+                break
+            
+            candidate = os.path.join(target_dir, src_name + ext)
+            if os.path.exists(candidate):
+                tgt_path = candidate
+                break
+        
+        if tgt_path is not None:
+            pairs.append({'source': src_path, 'target': tgt_path, 'scene': src_name})
+        else:
+            print(f"Attention: Pas de correspondant trouvé pour {src_basename} dans {target_dir}")
+    
+    return pairs
 
 
-def _load_points_from_file(path):
-    ext = os.path.splitext(path)[1].lower()
+def estimate_normals(points, k=20):
+    """Estime les normales pour un nuage de points."""
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+    pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=k))
+    return np.asarray(pcd.normals).astype(np.float32)
 
-    if ext in ('.ply', '.pcd'):
-        pcd = o3d.io.read_point_cloud(path)
-        pts = np.asarray(pcd.points).astype(np.float32)
-        return pts
 
-    if ext in ('.xyz', '.txt', '.pts'):
-        pts = np.loadtxt(path, dtype=np.float32)
-        if pts.ndim == 1:
-            pts = pts[None, :]
-        if pts.shape[1] < 3:
-            raise ValueError(f"{path}: besoin d'au moins 3 colonnes (x y z)")
-        return pts[:, :3].astype(np.float32)
-
-    if ext == '.npy':
-        pts = np.asarray(np.load(path), dtype=np.float32)
-        if pts.ndim != 2 or pts.shape[1] < 3:
-            raise ValueError(f"{path}: attendu (N,3)")
-        return pts[:, :3].astype(np.float32)
-
-    if ext == '.npz':
-        data = np.load(path)
-        for k in ['points', 'xyz', 'pc', 'arr_0']:
-            if k in data:
-                pts = np.asarray(data[k], dtype=np.float32)
-                if pts.ndim == 2 and pts.shape[1] >= 3:
-                    return pts[:, :3].astype(np.float32)
-        raise ValueError(f"{path}: aucune clé points/xyz/pc/arr_0 trouvée")
-
-    raise ValueError(f"Extension non supportée: {ext}")
+def compute_fpfh(points, normals):
+    """Calcule les descripteurs FPFH."""
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+    pcd.normals = o3d.utility.Vector3dVector(normals)
+    
+    fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+        pcd,
+        o3d.geometry.KDTreeSearchParamKNN(knn=20)
+    )
+    return np.asarray(fpfh.data).T  # (N, 33)
 
 
 class CrossSourceDataset(Dataset):
-
-    def __init__(self, root_dir, mode='train', num_points=1024):
-        folder_name = 'train_data' if mode == 'train' else 'test_data'
-
-        cand1 = os.path.join(root_dir, 'data', folder_name)
-        cand2 = os.path.join(root_dir, folder_name)
-
-        if os.path.exists(cand1):
-            self.src_dir = cand1
-        elif os.path.exists(cand2):
-            self.src_dir = cand2
+    def __init__(self, root_dir, mode='train', num_points=1024,
+                 source_sensor='lidar', target_sensor='kinect',
+                 use_normals=True, use_fpfh=False):
+        
+        if mode == 'train':
+            self.data_dir = os.path.join(root_dir, 'data', 'train_data')
         else:
-            self.src_dir = cand1  # pour afficher un message clair
-
+            self.data_dir = os.path.join(root_dir, 'data', 'test_data')
+        
         self.num_points = int(num_points)
-
-        self.filepaths = _find_files_recursive(self.src_dir)
-        self.data_cache = []
-
-        # NO RESIZE: on centre seulement, scale=1
-        self.norm_params = {}   # basename -> (mean, 1.0)
-        self.path_map = {}      # basename -> path
-
-        self.current_max_angle = np.deg2rad(30)
-
-        print(f"[DATA] Chargement {mode.upper()} depuis {self.src_dir} ...")
-        print(f"      {len(self.filepaths)} fichiers trouvés ({SUPPORTED_EXTS}).")
-
-        for path in self.filepaths:
-            fname = os.path.basename(path)
-            try:
-                points = _load_points_from_file(path)
-                if points.shape[0] < 10:
-                    continue
-
-                self.path_map[fname] = path
-
-                # downsample RAM (ne change pas l'échelle)
-                if len(points) > 10000:
-                    indices = np.random.choice(len(points), 10000, replace=False)
-                    points = points[indices]
-
-                # centre seulement (pas de /scale)
-                mean = np.mean(points, axis=0).astype(np.float32)
-                points = (points - mean).astype(np.float32)
-                scale = 1.0
-
-                self.norm_params[fname] = (mean, scale)
-                self.data_cache.append((points, fname))
-
-            except Exception as e:
-                print(f"[WARN] Skip {fname}: {e}")
-
-        if len(self.data_cache) == 0:
-            print("\n[ERREUR] Dataset vide après chargement.")
-            print("Vérifie que tes fichiers sont bien dans :")
-            print(f"  - {cand1}")
-            print(f"  - ou {cand2}\n")
-
-        # duplication si dataset trop petit
-        if len(self.data_cache) > 0 and len(self.data_cache) < 32:
-            while len(self.data_cache) < 64:
-                self.data_cache = self.data_cache + self.data_cache
-
-    def set_difficulty(self, degrees):
-        self.current_max_angle = np.deg2rad(degrees)
-
+        self.source_sensor = source_sensor
+        self.target_sensor = target_sensor
+        self.use_normals = use_normals
+        self.use_fpfh = use_fpfh
+        
+        source_full_path = os.path.join(self.data_dir, source_sensor)
+        target_full_path = os.path.join(self.data_dir, target_sensor)
+        
+        print(f"\n[DATA] Recherche dans:")
+        print(f"  Source: {source_full_path}")
+        print(f"  Target: {target_full_path}")
+        
+        if not os.path.exists(source_full_path):
+            print(f"  [WARN] Dossier source n'existe pas: {source_full_path}")
+        if not os.path.exists(target_full_path):
+            print(f"  [WARN] Dossier target n'existe pas: {target_full_path}")
+        
+        self.pairs = find_pairs_from_folders(self.data_dir, source_sensor=source_sensor, target_sensor=target_sensor)
+        
+        print(f"\n[DATA] Chargement {mode.upper()} depuis {self.data_dir}")
+        print(f"      {len(self.pairs)} paires cross-source trouvées")
+        print(f"      Source: {source_sensor} -> Target: {target_sensor}")
+        print(f"      Normales: {use_normals}, FPFH: {use_fpfh}")
+        
+        self.cache = {}
+        
+        if len(self.pairs) == 0:
+            print("\n[ERREUR] Aucune paire cross-source trouvée.")
+    
     def __len__(self):
-        return len(self.data_cache)
-
-    def get_norm_params(self, fname):
-        return self.norm_params.get(fname, (np.zeros(3, dtype=np.float32), 1.0))
-
-    def get_file_path(self, fname):
-        return self.path_map.get(fname, os.path.join(self.src_dir, fname))
-
+        return len(self.pairs)
+    
+    def _load_points(self, path):
+        if path in self.cache:
+            return self.cache[path]['points'], self.cache[path]['raw']
+        
+        ext = os.path.splitext(path)[1].lower()
+        if ext in ('.ply', '.pcd'):
+            pcd = o3d.io.read_point_cloud(path)
+            pts = np.asarray(pcd.points).astype(np.float32)
+        elif ext in ('.xyz', '.txt', '.pts'):
+            pts = np.loadtxt(path, dtype=np.float32)
+            if pts.ndim == 1: pts = pts[None, :]
+            pts = pts[:, :3].astype(np.float32)
+        elif ext == '.npy':
+            pts = np.load(path).astype(np.float32)[:, :3]
+        elif ext == '.npz':
+            data = np.load(path)
+            for k in ['points', 'xyz', 'pc', 'arr_0']:
+                if k in data:
+                    pts = data[k].astype(np.float32)[:, :3]
+                    break
+        
+        self.cache[path] = {'points': pts, 'raw': pts.copy()}
+        return pts, pts
+    
+    def _preprocess(self, points, compute_normals=True):
+        mean = np.mean(points, axis=0)
+        points_centered = points - mean
+        result = {'points': points_centered, 'mean': mean, 'raw': points}
+        
+        if compute_normals and (self.use_normals or self.use_fpfh):
+            try:
+                result['normals'] = estimate_normals(points)
+            except Exception as e:
+                print(f"Warning: Impossible de calculer les normales: {e}")
+                result['normals'] = np.zeros_like(points)
+        return result
+    
     def __getitem__(self, idx):
-        points_original, fname = self.data_cache[idx]
-
-        # target = FPS (downsample) mais échelle conservée
-        pts_tgt = farthest_point_sample(points_original, self.num_points)
-
-        # source = target transformée
-        pts_src_clean = pts_tgt.copy()
-
-        R, t = get_random_transform_adaptive(pts_tgt, self.current_max_angle)
-        pts_src = apply_transform(pts_src_clean, R, t)
-
-        # bruit (en unités du dataset)
-        noise = np.random.normal(0, 0.005, pts_src.shape).astype(np.float32)
-        pts_src += noise
-
-        src_tensor = torch.from_numpy(pts_src).float().transpose(1, 0)  # (3,N)
-        tgt_tensor = torch.from_numpy(pts_tgt).float().transpose(1, 0)  # (3,N)
-        true_R = torch.from_numpy(R).float()
-        true_t = torch.from_numpy(t).float()
-
-        return src_tensor, tgt_tensor, true_R, true_t, fname
+        pair = self.pairs[idx]
+        try:
+            src_points, _ = self._load_points(pair['source'])
+            tgt_points, _ = self._load_points(pair['target'])
+            
+            src_data = self._preprocess(src_points)
+            tgt_data = self._preprocess(tgt_points)
+            
+            # --- CORRECTION ICI : Concaténer XYZ et Normales AVANT le sampling ---
+            src_input = src_data['points']
+            tgt_input = tgt_data['points']
+            
+            if self.use_normals and 'normals' in src_data:
+                src_input = np.concatenate([src_input, src_data['normals']], axis=1)
+            if self.use_normals and 'normals' in tgt_data:
+                tgt_input = np.concatenate([tgt_input, tgt_data['normals']], axis=1)
+            
+            # Le FPS se fera uniquement sur le XYZ (grâce au point[:, :3] dans ta fonction)
+            # mais il gardera les normales synchronisées !
+            src_sampled = farthest_point_sample(src_input, self.num_points)
+            tgt_sampled = farthest_point_sample(tgt_input, self.num_points)
+            
+            src_pts = src_sampled[:, :3]
+            tgt_pts = tgt_sampled[:, :3]
+            
+            # src_sampled contient désormais (N, 6) si use_normals=True
+            src_features = [src_sampled]
+            tgt_features = [tgt_sampled]
+            
+            if self.use_fpfh and 'normals' in src_data and 'normals' in tgt_data:
+                try:
+                    src_n = src_sampled[:, 3:6] if self.use_normals else estimate_normals(src_pts)
+                    tgt_n = tgt_sampled[:, 3:6] if self.use_normals else estimate_normals(tgt_pts)
+                    
+                    src_features.append(compute_fpfh(src_pts, src_n))
+                    tgt_features.append(compute_fpfh(tgt_pts, tgt_n))
+                except Exception as e:
+                    pass
+            
+            src_enhanced = np.concatenate(src_features, axis=1).astype(np.float32)
+            tgt_enhanced = np.concatenate(tgt_features, axis=1).astype(np.float32)
+            
+            return {
+                'src': torch.from_numpy(src_enhanced).float(),      
+                'tgt': torch.from_numpy(tgt_enhanced).float(),      
+                'src_xyz': torch.from_numpy(src_pts).float(),       
+                'tgt_xyz': torch.from_numpy(tgt_pts).float(),       
+                'R': torch.eye(3).float(),
+                't': torch.zeros(3).float(),
+                'scene': pair['scene'],
+                'src_path': pair['source'],
+                'tgt_path': pair['target']
+            }
+            
+        except Exception as e:
+            dummy = torch.zeros((self.num_points, 6 if self.use_normals else 3))
+            dummy_xyz = torch.zeros((self.num_points, 3))
+            return {
+                'src': dummy, 'tgt': dummy, 'src_xyz': dummy_xyz, 'tgt_xyz': dummy_xyz,
+                'R': torch.eye(3), 't': torch.zeros(3), 'scene': 'error',
+                'src_path': '', 'tgt_path': ''
+            }
