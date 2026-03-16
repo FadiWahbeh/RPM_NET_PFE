@@ -1,157 +1,452 @@
 import os
+import sys
+import time
+import csv
+import numpy as np
 import torch
 import torch.optim as optim
-import torch.nn as nn
 from torch.utils.data import DataLoader
 import open3d as o3d
-import time
-import copy # Pour la fusion propre des nuages
 
-from data.dataset import SingleSourceDataset
-from models.rpmnet import RPMNet
-from utils.transform import transform_point_cloud_torch
+# =========================
+# SETTINGS
+# =========================
+SAVE_BEST = True
+BEST_NAME = "rpm_best.pth"
 
-# --- CONFIGURATION ---
+LCP_RATIO = 0.02
+RMSE_UNIT = "m"
+LOG_RMSE_NORM = True
+
+# ICP only for EXPORT (pas pendant les métriques)
+USE_ICP_FOR_EXPORT = True
+ICP_VOXEL = 0.10
+ICP_MAX_CORR_FACTOR = 0.05
+ICP_ITERS = 30
+ICP_POINT_TO_PLANE = True
+
+# Metrics speed
+METRICS_MAX_BATCHES_TRAIN = 5
+METRICS_MAX_BATCHES_VAL = 10
+
+# Early stopping / rollback
+EARLY_STOPPING = True
+PATIENCE_EPOCHS = 10
+ROLLBACK_ON_DEGRADE = True
+DEGRADE_TOL = 1.10
+ROLLBACK_LR_FACTOR = 0.5
+
+# =========================
+# PATHS
+# =========================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
-CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "checkpoints")
-VISUAL_DIR = os.path.join(OUTPUT_DIR, "visuals")
+for p in [BASE_DIR, os.path.join(BASE_DIR, "models"), os.path.join(BASE_DIR, "utils")]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
+from matrics import compute_rmse_cloudcompare, compute_lcp_adaptive
+from paired_dataset import PairedKinectLidarDataset
+
+try:
+    from models.rpmnet import RPMNet
+except Exception:
+    from rpmnet import RPMNet
+
+try:
+    from utils.transform import transform_point_cloud_torch
+except Exception:
+    from transform import transform_point_cloud_torch
+
+# OUTPUTS
+OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
+VIS_TRAIN_DIR = os.path.join(OUTPUT_DIR, "visuals_train")
+VIS_TEST_DIR  = os.path.join(OUTPUT_DIR, "visuals_test")
+CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "checkpoints")
+LOG_FILE = os.path.join(OUTPUT_DIR, "training_log.csv")
+
+os.makedirs(VIS_TRAIN_DIR, exist_ok=True)
+os.makedirs(VIS_TEST_DIR, exist_ok=True)
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-os.makedirs(VISUAL_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# --- REGLAGES FINS ---
+# HYPERPARAMS
+EPOCHS =  nb                            
+BATCH_SIZE = 8
+LR = 1e-4
+NUM_POINTS = 1024
+NUM_ITERS = 5
+SAVE_EVERY = 1
 
-EPOCHS = 30       
-BATCH_SIZE = 8    
-LR = 0.00005
-
-EPOCHS = 30       # Pas besoin de plus si Ep5 est déjà bon
-BATCH_SIZE = 8    
-LR = 0.00005      # <--- J'ai baissé ça (c'était 0.0001). Plus doux pour ne pas "casser" la perfection.
+# DataLoader perf (Windows: si soucis -> NUM_WORKERS=0)
+NUM_WORKERS = 4
+PIN_MEMORY = True
+PERSISTENT_WORKERS = True
 
 
-def save_combined_ply(pcd1_tensor, color1, pcd2_tensor, color2, filename):
-    """ Fusionne physiquement deux nuages dans un seul fichier .ply """
-    
-    # Conversion Tensor -> Numpy
-    pts1 = pcd1_tensor.cpu().detach().numpy().T
-    pts2 = pcd2_tensor.cpu().detach().numpy().T
-    
-    # Création des objets Open3D
-    cloud1 = o3d.geometry.PointCloud()
-    cloud1.points = o3d.utility.Vector3dVector(pts1)
+# =========================
+# Helpers
+# =========================
+def batch_diag_from_tgt(tgt_b3n: torch.Tensor, eps=1e-9) -> torch.Tensor:
+    pmin = tgt_b3n.amin(dim=2)
+    pmax = tgt_b3n.amax(dim=2)
+    diag = torch.norm(pmax - pmin, dim=1)
+    return torch.clamp(diag, min=eps)
 
-    cloud1.paint_uniform_color(color1)
-    
-    cloud2 = o3d.geometry.PointCloud()
-    cloud2.points = o3d.utility.Vector3dVector(pts2)
-    cloud2.paint_uniform_color(color2) 
-    
-    # Fusion
+def rmse_percent_of_size(rmse_abs: float, diag: float) -> float:
+    if diag <= 1e-12:
+        return 0.0
+    return 100.0 * (rmse_abs / diag)
 
-    cloud1.paint_uniform_color(color1) # ex: Rouge
-    
-    cloud2 = o3d.geometry.PointCloud()
-    cloud2.points = o3d.utility.Vector3dVector(pts2)
-    cloud2.paint_uniform_color(color2) # ex: Vert
-    
-    # Fusion (Concaténation)
+def diag_np_from_points(points_np: np.ndarray) -> float:
+    pmin = points_np.min(axis=0)
+    pmax = points_np.max(axis=0)
+    return float(np.linalg.norm(pmax - pmin))
 
-    combined = cloud1 + cloud2
-    
-    # Sauvegarde
-    o3d.io.write_point_cloud(filename, combined)
+def save_ply(points_np, colors_np, out_path):
+    cloud = o3d.geometry.PointCloud()
+    cloud.points = o3d.utility.Vector3dVector(points_np.astype(np.float32))
+    cloud.colors = o3d.utility.Vector3dVector(colors_np.astype(np.float32))
+    o3d.io.write_point_cloud(out_path, cloud)
 
+def save_colored_single(points_np, rgb, out_path):
+    colors = np.tile(np.array(rgb, dtype=np.float32)[None, :], (points_np.shape[0], 1))
+    save_ply(points_np, colors, out_path)
+
+def save_colored_pair(pointsA, rgbA, pointsB, rgbB, out_path):
+    A = pointsA.astype(np.float32)
+    B = pointsB.astype(np.float32)
+    P = np.vstack([A, B])
+    CA = np.tile(np.array(rgbA, dtype=np.float32)[None, :], (A.shape[0], 1))
+    CB = np.tile(np.array(rgbB, dtype=np.float32)[None, :], (B.shape[0], 1))
+    C = np.vstack([CA, CB])
+    save_ply(P, C, out_path)
+
+
+# ✅ Distance de Chamfer symétrique — remplace MSE point-à-point
+# Mathématiquement: (1/N)Σ_i min_j||si-tj||² + (1/M)Σ_j min_i||tj-si||²
+# Correcte pour des nuages sans correspondance par index (Kinect ≠ LiDAR).
+# L'ancienne MSE(src_iter - tgt) comparait des points aléatoires et ne
+# supervisait aucun alignement réel.
+def chamfer_loss_batch(src_t: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
+    """
+    src_t, tgt: (B, 3, N) — déjà normalisés par diag si besoin.
+    Retourne un scalaire (moyenne sur le batch).
+    """
+    s = src_t.transpose(1, 2)                         # (B,N,3)
+    t = tgt.transpose(1, 2)                           # (B,M,3)
+
+    ss = (s ** 2).sum(dim=2, keepdim=True)            # (B,N,1)
+    tt = (t ** 2).sum(dim=2, keepdim=True)            # (B,M,1)
+    cross = torch.bmm(s, t.transpose(1, 2))           # (B,N,M)
+    dist2 = (ss - 2.0 * cross + tt.transpose(1, 2)).clamp(min=0.0)  # (B,N,M)
+
+    d_s2t = dist2.min(dim=2).values.mean(dim=1)       # (B,) src→tgt
+    d_t2s = dist2.min(dim=1).values.mean(dim=1)       # (B,) tgt→src
+    return (d_s2t + d_t2s).mean()                     # scalaire
+
+
+# =========================
+# ICP only for EXPORT
+# =========================
+def _to_o3d_pcd(points_np: np.ndarray) -> o3d.geometry.PointCloud:
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points_np.astype(np.float64))
+    return pcd
+
+def icp_refine_o3d(src_np: np.ndarray, tgt_np: np.ndarray) -> np.ndarray:
+    src = _to_o3d_pcd(src_np)
+    tgt = _to_o3d_pcd(tgt_np)
+
+    if ICP_VOXEL and ICP_VOXEL > 0:
+        src = src.voxel_down_sample(float(ICP_VOXEL))
+        tgt = tgt.voxel_down_sample(float(ICP_VOXEL))
+
+    if len(src.points) < 30 or len(tgt.points) < 30:
+        return src_np
+
+    if ICP_POINT_TO_PLANE:
+        radius = float(max(ICP_VOXEL * 2.0, 1e-6))
+        tgt.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=30))
+        src.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=30))
+
+    tgt_pts = np.asarray(tgt.points)
+    pmin = tgt_pts.min(axis=0)
+    pmax = tgt_pts.max(axis=0)
+    diag = float(np.linalg.norm(pmax - pmin)) if tgt_pts.shape[0] > 10 else 1.0
+    max_corr = float(max(1e-6, ICP_MAX_CORR_FACTOR * diag))
+
+    T0 = np.eye(4, dtype=np.float64)
+
+    if ICP_POINT_TO_PLANE:
+        estimation = o3d.pipelines.registration.TransformationEstimationPointToPlane()
+    else:
+        estimation = o3d.pipelines.registration.TransformationEstimationPointToPoint()
+
+    reg = o3d.pipelines.registration.registration_icp(
+        src, tgt, max_corr, T0, estimation,
+        o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=int(ICP_ITERS))
+    )
+    T = reg.transformation
+    R = T[:3, :3].astype(np.float32)
+    t = T[:3, 3].astype(np.float32)
+    return (src_np @ R.T) + t
+
+# =========================
+# Export visuals (LOW)
+# =========================
+def export_low(epoch_idx, base_dir, src_tensor, tgt_tensor, transforms):
+    ep_dir = os.path.join(base_dir, f"Ep{epoch_idx:03d}")
+    os.makedirs(ep_dir, exist_ok=True)
+
+    src0 = src_tensor[0].detach().cpu().numpy().T
+    tgt0 = tgt_tensor[0].detach().cpu().numpy().T
+
+    save_colored_single(tgt0, [0, 1, 0], os.path.join(ep_dir, "Target_low.ply"))
+    save_colored_single(src0, [1, 0, 0], os.path.join(ep_dir, "Start_low.ply"))
+    save_colored_pair(src0, [1, 0, 0], tgt0, [0, 1, 0], os.path.join(ep_dir, "Start_plus_Target_low.ply"))
+
+    last_src_it = None
+    for i, (r_it, t_it) in enumerate(transforms):
+        src_it = transform_point_cloud_torch(src_tensor, r_it, t_it)[0].detach().cpu().numpy().T
+        last_src_it = src_it
+        save_colored_single(src_it, [0, 0, 1], os.path.join(ep_dir, f"Result_it{i+1}_low.ply"))
+        save_colored_pair(src_it, [0, 0, 1], tgt0, [0, 1, 0], os.path.join(ep_dir, f"Result_it{i+1}_plus_Target_low.ply"))
+
+    if USE_ICP_FOR_EXPORT and last_src_it is not None:
+        src_icp = icp_refine_o3d(last_src_it, tgt0)
+        save_colored_single(src_icp, [0, 1, 1], os.path.join(ep_dir, "Result_ICP_low.ply"))
+        save_colored_pair(src_icp, [0, 1, 1], tgt0, [0, 1, 0], os.path.join(ep_dir, "Result_ICP_plus_Target_low.ply"))
+
+# =========================
+# TRAIN
+# =========================
 def train():
-    print(f"--- TRAIN RPM-NET (Save All Epochs) ---")
-    
-    dataset = SingleSourceDataset(BASE_DIR, num_points=512)
-    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
-    
-    model = RPMNet(num_iterations=5).to(DEVICE)
-    optimizer = optim.Adam(model.parameters(), lr=LR)
+    print(" TRAIN Kinect->LiDAR (FAST) - ICP only for EXPORT, cached dataset, lite metrics")
+
+    train_dataset = PairedKinectLidarDataset(BASE_DIR, mode="train", num_points=NUM_POINTS, preload_cache=True)
+    test_dataset  = PairedKinectLidarDataset(BASE_DIR, mode="test",  num_points=NUM_POINTS, preload_cache=True)
+
+    if len(train_dataset) == 0 or len(test_dataset) == 0:
+        raise RuntimeError("Dataset pairé vide. Vérifie noms identiques Kinect/LiDAR.")
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True,
+        num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY,
+        persistent_workers=PERSISTENT_WORKERS if NUM_WORKERS > 0 else False
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=BATCH_SIZE, shuffle=False, drop_last=False,
+        num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY,
+        persistent_workers=PERSISTENT_WORKERS if NUM_WORKERS > 0 else False
+    )
+
+    model = RPMNet(num_iterations=NUM_ITERS, use_dsc_lite=True, dsc_k=12).to(DEVICE)
+    optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, verbose=True)
-    mse_loss = nn.MSELoss()
+    # ✅ nn.MSELoss supprimé: remplacé par chamfer_loss_batch
 
-    model.train()
+    best_val = float("inf")
+    best_path = os.path.join(CHECKPOINT_DIR, BEST_NAME)
+    best_state = None
+    bad_epochs = 0
 
-    for epoch in range(EPOCHS):
-        total_loss = 0
-        start_time = time.time()
-        
-        for src, tgt, true_R, true_t, _ in loader:
-            src, tgt = src.to(DEVICE), tgt.to(DEVICE)
-            true_R, true_t = true_R.to(DEVICE), true_t.to(DEVICE)
-            
+    write_header = not os.path.exists(LOG_FILE)
+    header = [
+        "Epoch",
+        "Train_Loss", "Val_Loss",
+        "Train_RMSE", "Val_RMSE",
+        "Train_RMSE_Unit", "Val_RMSE_Unit",
+        "Train_RMSE_Pct", "Val_RMSE_Pct",
+        "Train_LCP", "Val_LCP",
+        "Epoch_Time_s", "Total_Time_s"
+    ]
+    if write_header:
+        with open(LOG_FILE, "w", newline="") as f:
+            csv.writer(f).writerow(header)
+
+    t_total0 = time.perf_counter()
+
+    for epoch in range(1, EPOCHS + 1):
+        t_epoch0 = time.perf_counter()
+
+        # ---------------- TRAIN ----------------
+        model.train()
+        total_loss = 0.0
+        train_rmse_list, train_rmse_pct_list, train_lcp_list = [], [], []
+        export_train_pack = None
+
+        for bi, (src, tgt, _true_R, _true_t, fnames) in enumerate(train_loader):
+            src, tgt = src.to(DEVICE, non_blocking=True), tgt.to(DEVICE, non_blocking=True)
             optimizer.zero_grad()
-            
-            R_pred, t_pred, transforms = model(src, tgt)
-            
-            loss = 0
+
+            R_pred, t_pred, transforms = model(src, tgt, return_timings=False)
+
+            diag = batch_diag_from_tgt(tgt)   # (B,)
+            diag_b = diag.view(-1, 1, 1)       # (B,1,1)
+
+            # ✅ FIX LOSS: Chamfer symétrique avec pondération itérative.
+            # MSE(src_iter - tgt) comparait points par index sans correspondance
+            # réelle entre Kinect et LiDAR → ne supervisait aucun alignement.
+            loss = torch.zeros(1, device=DEVICE)
             n_iters = len(transforms)
             for i, (r_iter, t_iter) in enumerate(transforms):
                 w = 1.0 / (2 ** (n_iters - 1 - i))
-                l_r = mse_loss(torch.matmul(r_iter.transpose(1, 2), true_R), torch.eye(3).to(DEVICE).unsqueeze(0).repeat(src.size(0),1,1))
-                l_t = mse_loss(t_iter, true_t)
-                loss += w * (l_r + l_t)
-            
+                src_iter = transform_point_cloud_torch(src, r_iter, t_iter)
+                loss = loss + w * chamfer_loss_batch(src_iter / diag_b, tgt / diag_b)
+            loss = loss.squeeze()
+
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            total_loss += loss.item()
-            
-        avg_loss = total_loss / len(loader)
-        scheduler.step(avg_loss)
-        
-        print(f"Epoch {epoch+1:03d} | Loss: {avg_loss:.6f} | Time: {time.time() - start_time:.1f}s")
 
+            total_loss += float(loss.item())
 
-        # SAUVEGARDE À CHAQUE EPOCH
-        # 1. Le Cerveau
-        torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, f"rpm_epoch_{epoch+1}.pth"))
-        
-        # 2. Les Images
+            # ✅ FIX EXPORT: .detach() sur les transforms pour libérer le graphe
+            # de calcul GPU dès le premier batch au lieu d'attendre la fin de l'epoch.
+            if export_train_pack is None:
+                export_train_pack = (
+                    src.detach(),
+                    tgt.detach(),
+                    [(r.detach(), t.detach()) for r, t in transforms]
+                )
 
-        # --- SAUVEGARDE À CHAQUE EPOCH (1, 2, 3...) ---
-        # Plus de modulo %, on sauvegarde tout.
-        
-        # 1. Le Cerveau (.pth)
-        torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, f"rpm_epoch_{epoch+1}.pth"))
-        
-        # 2. Les Images (.ply)
+            # Metrics only on a few batches
+            if bi < METRICS_MAX_BATCHES_TRAIN:
+                with torch.no_grad():
+                    src_final = transform_point_cloud_torch(src, R_pred, t_pred)
+                    for b in range(src.size(0)):
+                        p_pred = src_final[b].transpose(0, 1)
+                        p_tgt = tgt[b].transpose(0, 1)
+
+                        rmse_abs = compute_rmse_cloudcompare(p_pred, p_tgt)
+                        train_rmse_list.append(rmse_abs)
+
+                        if LOG_RMSE_NORM:
+                            d = diag_np_from_points(p_tgt.detach().cpu().numpy())
+                            train_rmse_pct_list.append(rmse_percent_of_size(rmse_abs, d))
+
+                        train_lcp_list.append(compute_lcp_adaptive(p_pred, p_tgt, ratio=LCP_RATIO))
+
+        train_loss = total_loss / max(1, len(train_loader))
+        train_rmse = float(np.mean(train_rmse_list)) if train_rmse_list else 0.0
+        train_rmse_pct = float(np.mean(train_rmse_pct_list)) if train_rmse_pct_list else 0.0
+        train_lcp = float(np.mean(train_lcp_list)) if train_lcp_list else 0.0
+
+        # ---------------- VAL ----------------
+        model.eval()
+        val_loss_acc = 0.0
+        val_rmse_list, val_rmse_pct_list, val_lcp_list = [], [], []
+        export_test_pack = None
 
         with torch.no_grad():
-             # On prend le premier exemple du batch
-             src_0 = src[0]
-             tgt_0 = tgt[0]
-             
-             # Résultat IA
-             res_0 = transform_point_cloud_torch(src[0:1], R_pred[0:1], t_pred[0:1])[0]
+            for bi, (src, tgt, _true_R, _true_t, fnames) in enumerate(test_loader):
+                src, tgt = src.to(DEVICE, non_blocking=True), tgt.to(DEVICE, non_blocking=True)
 
-             # SAUVEGARDE DEPART (Rouge + Vert)
-             save_combined_ply(
-                 src_0, [1, 0, 0],  # Rouge
-                 tgt_0, [0, 1, 0],  # Vert
-                 os.path.join(VISUAL_DIR, f"Ep{epoch+1}_DEPART.ply")
-             )
-             
+                R_pred, t_pred, transforms = model(src, tgt, return_timings=False)
 
-             # SAUVEGARDE RESULTAT
-             save_combined_ply(
-                 res_0, [1, 0, 0],  # Bleu
-             )
-             # SAUVEGARDE RESULTAT (Bleu + Vert)
-             save_combined_ply(
-                 res_0, [0, 0, 1],  # Bleu
+                diag = batch_diag_from_tgt(tgt)
+                diag_b = diag.view(-1, 1, 1)
 
-                 tgt_0, [0, 1, 0],  # Vert
-                 os.path.join(VISUAL_DIR, f"Ep{epoch+1}_FINAL.ply")
-             )
-             
-             print(f"   -> Ep{epoch+1} sauvegardée.")
+                # ✅ FIX VAL LOSS: même formule pondérée que train.
+                # L'ancienne version n'utilisait que la dernière itération avec
+                # poids=1 → courbes train/val mathématiquement incomparables.
+                v_loss = torch.zeros(1, device=DEVICE)
+                n_iters = len(transforms)
+                for i, (r_iter, t_iter) in enumerate(transforms):
+                    w = 1.0 / (2 ** (n_iters - 1 - i))
+                    src_iter_v = transform_point_cloud_torch(src, r_iter, t_iter)
+                    v_loss = v_loss + w * chamfer_loss_batch(src_iter_v / diag_b, tgt / diag_b)
+                val_loss_acc += float(v_loss.item())
+
+                # src_final_val pour les métriques (dernière itération)
+                src_final_val = transform_point_cloud_torch(src, *transforms[-1])
+
+                # ✅ FIX EXPORT: .detach() sur les transforms
+                if export_test_pack is None:
+                    export_test_pack = (
+                        src.detach(),
+                        tgt.detach(),
+                        [(r.detach(), t.detach()) for r, t in transforms]
+                    )
+
+                if bi < METRICS_MAX_BATCHES_VAL:
+                    for b in range(src.size(0)):
+                        p_pred = src_final_val[b].transpose(0, 1)
+                        p_tgt = tgt[b].transpose(0, 1)
+
+                        rmse_abs = compute_rmse_cloudcompare(p_pred, p_tgt)
+                        val_rmse_list.append(rmse_abs)
+
+                        if LOG_RMSE_NORM:
+                            d = diag_np_from_points(p_tgt.detach().cpu().numpy())
+                            val_rmse_pct_list.append(rmse_percent_of_size(rmse_abs, d))
+
+                        val_lcp_list.append(compute_lcp_adaptive(p_pred, p_tgt, ratio=LCP_RATIO))
+
+        val_loss = val_loss_acc / max(1, len(test_loader))
+        val_rmse = float(np.mean(val_rmse_list)) if val_rmse_list else 0.0
+        val_rmse_pct = float(np.mean(val_rmse_pct_list)) if val_rmse_pct_list else 0.0
+        val_lcp = float(np.mean(val_lcp_list)) if val_lcp_list else 0.0
+
+        scheduler.step(val_loss)
+
+        # Time + print
+        t_epoch1 = time.perf_counter()
+        epoch_time = t_epoch1 - t_epoch0
+        total_time = t_epoch1 - t_total0
+
+        train_rmse_str = f"{train_rmse:.4f}{RMSE_UNIT}" + (f" ({train_rmse_pct:.2f}%)" if LOG_RMSE_NORM else "")
+        val_rmse_str = f"{val_rmse:.4f}{RMSE_UNIT}" + (f" ({val_rmse_pct:.2f}%)" if LOG_RMSE_NORM else "")
+
+        print(
+            f"Epoch {epoch:03d} | "
+            f"Train Loss {train_loss:.4f} RMSE {train_rmse_str} LCP {train_lcp:.2%} | "
+            f"Val Loss {val_loss:.4f} RMSE {val_rmse_str} LCP {val_lcp:.2%} | "
+            f"Epoch {epoch_time:.1f}s | Total {total_time/60:.1f}min"
+        )
+
+        with open(LOG_FILE, "a", newline="") as f:
+            csv.writer(f).writerow([
+                epoch, train_loss, val_loss,
+                train_rmse, val_rmse,
+                RMSE_UNIT, RMSE_UNIT,
+                train_rmse_pct, val_rmse_pct,
+                train_lcp, val_lcp,
+                epoch_time, total_time
+            ])
+
+        # BEST
+        if SAVE_BEST and val_loss < best_val:
+            best_val = val_loss
+            torch.save(model.state_dict(), best_path)
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            bad_epochs = 0
+            print(f"[BEST] Saved {best_path} (val_loss={best_val:.4f})")
+        else:
+            bad_epochs += 1
+
+        # Rollback
+        if ROLLBACK_ON_DEGRADE and best_state is not None and val_loss > DEGRADE_TOL * best_val:
+            print(f"[ROLLBACK] val_loss={val_loss:.4f} > {DEGRADE_TOL:.2f}*best={best_val:.4f} -> reload best, lr*= {ROLLBACK_LR_FACTOR}")
+            model.load_state_dict(best_state)
+            for g in optimizer.param_groups:
+                g["lr"] = g["lr"] * ROLLBACK_LR_FACTOR
+            bad_epochs = 0
+
+        # Early stop
+        if EARLY_STOPPING and bad_epochs >= PATIENCE_EPOCHS:
+            print(f"[EARLY STOP] no improvement for {PATIENCE_EPOCHS} epochs.")
+            break
+
+        # Exports
+        if epoch % SAVE_EVERY == 0:
+            if export_train_pack is not None:
+                export_low(epoch, VIS_TRAIN_DIR, *export_train_pack)
+            if export_test_pack is not None:
+                export_low(epoch, VIS_TEST_DIR, *export_test_pack)
+
 
 if __name__ == "__main__":
     train()
